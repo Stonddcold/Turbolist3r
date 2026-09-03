@@ -603,15 +603,29 @@ class NetcraftEnum(enumratorBaseThreaded):
     def enumerate(self):
         start_url = self.base_url.format(domain='example.com')
         resp = self.req(start_url)
+        if resp is None:
+            return self.subdomains
         cookies = self.get_cookies(resp.headers)
         url = self.base_url.format(domain=self.domain)
-        while True:
+        MAX_PAGES = 50
+        prev_url = None
+        for _ in range(MAX_PAGES):
             resp = self.get_response(self.req(url, cookies))
+            if not resp:
+                return self.subdomains
             self.extract_domains(resp)
             if 'Next page' not in resp:
                 return self.subdomains
-                break
-            url = self.get_next(resp)
+            try:
+                next_url = self.get_next(resp)
+            except Exception:
+                return self.subdomains
+            if next_url == prev_url:
+                # pagination link isn't advancing, bail out instead of looping forever
+                return self.subdomains
+            prev_url = url
+            url = next_url
+        return self.subdomains
 
     def extract_domains(self, resp):
         link_regx = re.compile(r'<a href="http://toolbar.netcraft.com/site_report\?url=(.*)">')
@@ -856,7 +870,7 @@ class CrtSearch(enumratorBaseThreaded):
         return self.subdomains
 
     def extract_domains(self, resp):
-        link_regx = re.compile(r'<TD>(.*?)</TD>')
+        link_regx = re.compile(r'<TD[^>]*>(.*?)</TD>')
         try:
             links = link_regx.findall(resp)
             for link in links:
@@ -1026,8 +1040,20 @@ def main(domain, threads, savefile, ports, silent, verbose, enable_bruteforce, e
     enums = [enum(domain, [], q=subdomains_queue, silent=silent, verbose=verbose) for enum in chosenEnums]
     for enum in enums:
         enum.start()
+
+    # Give each engine a bounded amount of time to finish. Search engines change their
+    # markup/anti-bot pages over time, and a stuck regex/pagination loop in one engine
+    # should never prevent the whole scan from completing.
+    ENGINE_TIMEOUT = 180
+    deadline = time.time() + ENGINE_TIMEOUT
     for enum in enums:
-        enum.join()
+        remaining = max(0, deadline - time.time())
+        enum.join(remaining)
+        if enum.is_alive():
+            if not silent:
+                print(R + "[!] %s did not finish in time, terminating it" % enum.engine_name + W)
+            enum.terminate()
+            enum.join()
 
     subdomains = set(subdomains_queue)
     for subdomain in subdomains:
